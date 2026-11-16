@@ -100,12 +100,22 @@ public final class RecordingReader {
     }
 
     /** Iterates framed records: calls back with (type, seq, rawTick, reader positioned at the fields, end). */
-    private interface RecordVisitor {
+    interface RecordVisitor {
         void visit(int type, long seq, int rawTick, BinReader fields, int fieldsStart, int end);
     }
 
-    private static void forEach(byte[] data, RecordVisitor v) {
+    /** Full header of one framed record, for consumers that need dt and frame too. */
+    interface FullVisitor {
+        void visit(int type, long seq, long t, int rawTick, long frame, BinReader fields, int fieldsStart, int end);
+    }
+
+    static void forEach(byte[] data, RecordVisitor v) {
+        forEachFull(data, (type, seq, t, tick, frame, f, start, end) -> v.visit(type, seq, tick, f, start, end));
+    }
+
+    static void forEachFull(byte[] data, FullVisitor v) {
         if (data == null) return;
+        long[] t = {0};
         BinReader r = new BinReader(data);
         while (r.remaining() > 0) {
             int type;
@@ -121,10 +131,10 @@ public final class RecordingReader {
             BinReader body = new BinReader(data, r.pos(), end);
             try {
                 long seq = body.uvarint();
-                body.svarint(); // dt
+                t[0] += body.svarint();
                 int tick = (int) body.svarint();
-                body.uvarint(); // frame
-                v.visit(type, seq, tick, body, body.pos(), end);
+                long frame = body.uvarint();
+                v.visit(type, seq, t[0], tick, frame, body, body.pos(), end);
             } catch (RuntimeException ignored) {
                 // undecodable record: skip it
             }
@@ -132,7 +142,7 @@ public final class RecordingReader {
         }
     }
 
-    private static Integer anchorFromEvents(byte[] data) {
+    static Integer anchorFromEvents(byte[] data) {
         Integer[] out = {null};
         forEach(data, (type, seq, tick, f, start, end) -> {
             if (out[0] != null || type != Records.EVENT) return;
@@ -204,7 +214,7 @@ public final class RecordingReader {
     }
 
     /** Zip file or partial directory. */
-    private interface Source extends AutoCloseable {
+    interface Source extends AutoCloseable {
         byte[] read(String name) throws IOException;
 
         @Override

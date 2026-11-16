@@ -245,3 +245,43 @@ The phase 4 acceptance test needs it. Details:
 Δpos, first divergent tick, missing mappings). Events: `REPLAY_ARMED`, `REPLAY_STARTED`
 (`heldAtStart`), `REPLAY_COMPLETE`, `REPLAY_ABORTED`, `REPLAY_PAUSED_ON_DRIFT`, `REPLAY_SUMMARY`,
 `BINDING_MISMATCH`, `OPTION_MISMATCH`.
+
+## Step 3: analysis polish (phase 5)
+
+`diff` already came with step 2 (see above). `export-moveplayer`, CSV output, glob filters and
+`irr_format.md` came with step 1. This step adds `strip`, the in-game export and tests.
+
+### `strip` (§8)
+
+- It rewrites records in place by byte offset: for each `PACKET_IN` / `PACKET_OUT` whose class
+  matches `--exclude-class`, `payloadMode` becomes 0 and the payload becomes empty. Every other byte
+  is copied unchanged (seq, time deltas, ticks, all other records), so `diff` between the original
+  and the stripped copy reports no divergence.
+- `--drop-summary` (not in the plan) also empties the summaries of those packets.
+- The input may be a crashed `.partial` directory; the output is always a finished zip with complete
+  gzip streams.
+- `metadata.stripped` records the source file and the patterns. The tool refuses to write over its
+  input.
+
+### In-game `/inputreplay export` (§8, optional)
+
+- `/inputreplay export <file> [stream] [classes]` writes `<name>.<stream>.jsonl` next to the
+  recording on a background thread and reports in chat when done. `classes` is a comma-separated
+  list of globs, and `!glob` excludes. There are no tick or phase filters; use `irr_dump.py` for
+  those.
+- The output has the same records and field names as `irr_dump.py dump --format jsonl` (apply stamps
+  joined into `PACKET_IN`, `PACKET_APPLY` omitted, `all` ordered by seq). `f32` fields are written
+  widened to double so the values match Python's exactly. Only `tMs` can differ in the last digit
+  (rounding).
+- The implementation (`io/RecordingExporter`) is pure Java with a `main`, so it also runs outside
+  Minecraft. The tests use this.
+
+### Tests (not in the plan)
+
+`tools/test_irr_dump.py` (stdlib `unittest`) builds recordings with its own encoder, written from
+`irr_format.md` rather than shared with the decoder. It covers field decoding, filters, CSV/text,
+`export-moveplayer`, crashed directories with a truncated gzip stream, `diff` (identical, divergent,
+epsilon, tick range, ignore list vs `--strict`, moved apply ticks) and `strip`. With
+`IRR_JAVA_CP=<client classes>:<gson>:<slf4j>` it also runs the Java exporter on the same files and
+requires record-for-record equality with `irr_dump.py dump`, which keeps the two decoders from
+drifting apart.

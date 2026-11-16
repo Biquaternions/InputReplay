@@ -2,6 +2,7 @@ package me.biquaternions.inputreplay.client;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import me.biquaternions.inputreplay.client.io.RecordingExporter;
 import me.biquaternions.inputreplay.client.replay.Replayer;
 import net.minecraft.commands.SharedSuggestionProvider;
 import com.mojang.brigadier.context.CommandContext;
@@ -96,6 +97,16 @@ public class InputreplayClient implements ClientModInitializer {
                                 .suggests((c, b) -> SharedSuggestionProvider.suggest(recordingNames(), b))
                                 .executes(c -> armReplay(c, false))
                                 .then(literal("physical").executes(c -> armReplay(c, true)))))
+                .then(literal("export")
+                        .then(argument("file", StringArgumentType.string())
+                                .suggests((c, b) -> SharedSuggestionProvider.suggest(recordingNames(), b))
+                                .executes(c -> export(c, "all", ""))
+                                .then(argument("stream", StringArgumentType.word())
+                                        .suggests((c, b) -> SharedSuggestionProvider.suggest(RecordingExporter.streams(), b))
+                                        .executes(c -> export(c, StringArgumentType.getString(c, "stream"), ""))
+                                        .then(argument("classes", StringArgumentType.greedyString())
+                                                .executes(c -> export(c, StringArgumentType.getString(c, "stream"),
+                                                        StringArgumentType.getString(c, "classes")))))))
                 .then(literal("stop").executes(c -> {
                     if (Replayer.active() != null) {
                         Replayer.active().abort("aborted");
@@ -149,6 +160,51 @@ public class InputreplayClient implements ClientModInitializer {
         SessionManager.arm(Mode.REPLAY, p, physical);
         c.getSource().sendFeedback(Component.literal("InputReplay: armed replay of " + p.getFileName()
                 + (physical ? " (physical keys)" : "") + " for the next connection"));
+        return 1;
+    }
+
+    /**
+     * {@code /inputreplay export <file> [stream] [classes]}: JSONL next to the recording, same format as
+     * {@code irr_dump.py dump --format jsonl}. {@code classes}: comma-separated globs, {@code !glob} excludes.
+     */
+    private static int export(CommandContext<FabricClientCommandSource> c, String stream, String classes) {
+        Path p = SessionManager.resolveRecording(Path.of(StringArgumentType.getString(c, "file")));
+        if (!Files.exists(p)) {
+            c.getSource().sendError(Component.literal("No such recording: " + p));
+            return 0;
+        }
+        if (!RecordingExporter.streams().contains(stream)) {
+            c.getSource().sendError(Component.literal("Unknown stream " + stream + "; one of " + RecordingExporter.streams()));
+            return 0;
+        }
+        List<String> inc = new java.util.ArrayList<>(), exc = new java.util.ArrayList<>();
+        for (String g : classes.split(",")) {
+            g = g.strip();
+            if (g.isEmpty()) continue;
+            if (g.startsWith("!")) exc.add(g.substring(1));
+            else inc.add(g);
+        }
+        String base = p.getFileName().toString().replaceAll("\\.irr(\\.partial)?$", "");
+        Path out = p.resolveSibling(base + "." + stream + ".jsonl");
+        RecordingExporter.Options opt = new RecordingExporter.Options(stream, inc, exc, true);
+        c.getSource().sendFeedback(Component.literal("InputReplay: exporting " + p.getFileName() + " ..."));
+        Minecraft mc = c.getSource().getClient();
+        Thread t = new Thread(() -> {
+            String msg;
+            try {
+                long n = RecordingExporter.export(p, out, opt);
+                msg = "InputReplay: exported " + n + " records to " + out;
+            } catch (Exception e) {
+                LOG.error("Export of {} failed", p, e);
+                msg = "InputReplay: export failed: " + e.getMessage();
+            }
+            String m = msg;
+            mc.execute(() -> {
+                if (mc.player != null) mc.player.sendSystemMessage(Component.literal(m));
+            });
+        }, "InputReplay-Export");
+        t.setDaemon(true);
+        t.start();
         return 1;
     }
 

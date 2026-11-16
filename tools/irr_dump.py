@@ -12,6 +12,7 @@ Accepts a finished ``.irr`` zip or a crashed ``.irr.partial`` directory.
                           [--phase play] [--no-payload] [--format jsonl|csv|text] [-o out.jsonl]
     irr_dump.py timeline  file.irr [--tick 100:250] [--class ...] [--exclude-class ...]
     irr_dump.py export-moveplayer file.irr [-o moves.csv]
+    irr_dump.py strip     file.irr -o small.irr --exclude-class 'Clientbound*Chunk*,ClientboundLightUpdatePacket'
     irr_dump.py diff      a.irr b.irr [--tick 0:500] [--epsilon 0] [--ignore-class ...] [--strict]
 """
 from __future__ import annotations
@@ -699,6 +700,101 @@ def cmd_diff(a) -> int:
     return 1 if diverged else 0
 
 
+def _uvarint_bytes(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _strip_stream(buf: bytes, patterns: list[str], drop_summary: bool) -> tuple[bytes, int, int]:
+    """Rewrites packet records whose class matches: payload removed (payloadMode 0), summary optionally
+    emptied. Every other byte (headers, other fields, other records) is copied unchanged."""
+    out = bytearray()
+    r = Reader(buf)
+    n = len(buf)
+    changed = saved = 0
+    while r.p < n:
+        start = r.p
+        try:
+            rtype = r.u8()
+            length = r.uvarint()
+        except IndexError:
+            break
+        body_start, end = r.p, r.p + length
+        if end > n:
+            break  # truncated tail of a crashed recording
+        if rtype in (20, 22):
+            f = Reader(buf, body_start)
+            f.uvarint(); f.svarint(); f.svarint(); f.uvarint()  # seq, dt, tick, frame
+            if rtype == 20:
+                f.uvarint(); f.str_(); f.svarint(); cls = f.str_(); f.svarint(); f.uvarint()
+            else:
+                f.str_(); f.svarint(); cls = f.str_(); f.uvarint(); f.u8()
+            mode_pos = f.p
+            f.u8()
+            summary_start = f.p
+            f.bytes_()
+            summary_end = f.p
+            payload = f.bytes_()
+            if any(fnmatch.fnmatchcase(cls, g) for g in patterns) and (payload or drop_summary):
+                new_body = bytearray(buf[body_start:mode_pos])
+                new_body.append(0)
+                new_body += _uvarint_bytes(0) if drop_summary else buf[summary_start:summary_end]
+                new_body += _uvarint_bytes(0)
+                out.append(rtype)
+                out += _uvarint_bytes(len(new_body))
+                out += new_body
+                changed += 1
+                saved += (end - body_start) - len(new_body)
+                r.p = end
+                continue
+        out += buf[start:end]
+        r.p = end
+    return bytes(out), changed, saved
+
+
+def cmd_strip(a) -> int:
+    patterns = globs(a.exclude_cls)
+    if not patterns:
+        print("strip: --exclude-class is required", file=sys.stderr)
+        return 2
+    if os.path.abspath(a.output) == os.path.abspath(a.file):
+        print("strip: refusing to overwrite the input; choose another -o", file=sys.stderr)
+        return 2
+    rec = Recording(a.file)
+    meta = dict(rec.meta)
+    meta["stripped"] = {"from": os.path.basename(a.file.rstrip("/")), "excludeClass": patterns,
+                        "dropSummary": a.drop_summary}
+    tmp = a.output + ".tmp"
+    total_changed = total_saved = 0
+    with zipfile.ZipFile(tmp, "w") as z:
+        z.writestr("metadata.json", json.dumps(meta, indent=2), compress_type=zipfile.ZIP_DEFLATED)
+        opts = rec._read("options.txt")
+        if opts is not None:
+            z.writestr("options.txt", opts, compress_type=zipfile.ZIP_DEFLATED)
+        for key, name in STREAMS.items():
+            data = rec._read(name)
+            if data is None:
+                continue
+            if key in ("in", "out"):
+                buf, changed, saved = _strip_stream(gunzip_tolerant(data), patterns, a.drop_summary)
+                total_changed += changed
+                total_saved += saved
+                data = gzip.compress(buf, compresslevel=6, mtime=0)
+            elif rec.partial:
+                data = gzip.compress(gunzip_tolerant(data), compresslevel=6, mtime=0)  # repair truncated stream
+            z.writestr(name, data, compress_type=zipfile.ZIP_STORED)
+    os.replace(tmp, a.output)
+    print(f"Stripped {total_changed} packet records ({total_saved / 1e6:.2f} MB uncompressed) -> {a.output}")
+    return 0
+
+
 def add_filters(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tick", help="anchored tick range, e.g. 100:250, 100:, :50 or 42")
     p.add_argument("--class", dest="cls", help="comma-separated class-name globs to include (packets)")
@@ -736,6 +832,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("file")
     p.add_argument("-o", "--output")
     p.set_defaults(fn=cmd_export_moveplayer)
+
+    p = sub.add_parser("strip", help="copy a recording with packet payloads dropped for some classes")
+    p.add_argument("file")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--exclude-class", dest="exclude_cls", help="comma-separated class globs whose payloads are dropped")
+    p.add_argument("--drop-summary", action="store_true", help="also empty the summaries of those packets")
+    p.set_defaults(fn=cmd_strip)
 
     p = sub.add_parser("diff", help="compare two recordings (e.g. original vs. replay run) tick by tick")
     p.add_argument("a")
