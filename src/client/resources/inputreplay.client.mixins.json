@@ -1,9 +1,23 @@
 {
   "required": true,
   "minVersion": "0.8",
-  "package": "me.biquaternions.inputreplay.mixin.client",
+  "package": "me.biquaternions.inputreplay.client.mixin.client",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "ConnectionAccessor",
+    "ConnectionMixin",
+    "ConnectScreenMixin",
+    "ConnectScreenThreadMixin",
+    "GuiMixin",
+    "KeyboardHandlerMixin",
+    "KeyMappingAccessor",
+    "LocalPlayerAccessor",
+    "MinecraftMixin",
+    "MouseHandlerAccessor",
+    "MouseHandlerMixin",
+    "PacketDecoderMixin",
+    "PacketEncoderMixin",
+    "PacketProcessorMixin"
   ],
   "injectors": {
     "defaultRequire": 1

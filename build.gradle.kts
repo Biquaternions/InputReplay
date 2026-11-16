@@ -25,6 +25,13 @@ loom {
         }
     }
 
+    runs {
+        named("client") {
+            // `gradle runClient -Dinputreplay.mode=replay -Dinputreplay.file=... -Dinputreplay.autoconnect=host:port`
+            providers.systemPropertiesPrefixedBy("inputreplay.").get().forEach { (k, v) -> property(k, v) }
+        }
+    }
+
 }
 
 repositories {

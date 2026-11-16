@@ -3,11 +3,12 @@
   "id": "inputreplay",
   "version": "${version}",
   "name": "InputReplay",
-  "description": "",
-  "authors": [],
+  "description": "Records player inputs, all packets and per-tick player state on a real client, and replays the inputs to test server physics.",
+  "authors": [
+    "Biquaternions"
+  ],
   "contact": {},
   "license": "GPL-3.0",
-  "icon": "assets/inputreplay/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [
