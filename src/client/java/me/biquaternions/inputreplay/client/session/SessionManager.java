@@ -11,6 +11,8 @@ import me.biquaternions.inputreplay.client.io.Records;
 import me.biquaternions.inputreplay.client.io.Records.Stream;
 import me.biquaternions.inputreplay.client.mixin.client.ConnectionAccessor;
 import me.biquaternions.inputreplay.client.mixin.client.KeyMappingAccessor;
+import me.biquaternions.inputreplay.client.io.RecordingReader;
+import me.biquaternions.inputreplay.client.replay.Replayer;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.api.ModContainer;
 import net.minecraft.SharedConstants;
@@ -54,6 +56,7 @@ public final class SessionManager {
     private static Mode armedMode;
     private static Path armedReplayFile;
     private static boolean armedForcePhysical;
+    private static RecordingReader armedReader;
     private static volatile Session session;
     private static volatile Connection connection;
     private static Path lastFinished;
@@ -90,6 +93,13 @@ public final class SessionManager {
         armedMode = mode;
         armedReplayFile = replayFile;
         armedForcePhysical = forcePhysical;
+        armedReader = null;
+    }
+
+    /** Arms a replay with a recording that was already loaded (and validated) by the list screen. */
+    public static void armReplay(RecordingReader reader, boolean forcePhysical) {
+        arm(Mode.REPLAY, reader.path, forcePhysical);
+        armedReader = reader;
     }
 
     public static void disarm() {
@@ -124,20 +134,25 @@ public final class SessionManager {
         Mode mode = armedMode;
         Path replayFile = armedReplayFile;
         boolean forcePhysical = armedForcePhysical;
+        RecordingReader reader = armedReader;
         disarm();
         if (s != null && !s.ended()) endSession("superseded");
         if (mode == Mode.PLAIN) return false;
         try {
-            startSession(mc, mode, address, data, replayFile, forcePhysical);
+            if (mode == Mode.REPLAY && reader == null) {
+                if (replayFile == null) throw new IllegalStateException("replay armed without a file");
+                reader = new RecordingReader(resolveRecording(replayFile));
+            }
+            startSession(mc, mode, address, data, reader, forcePhysical);
         } catch (Exception e) {
-            LOG.error("Could not start InputReplay session; connecting without recording", e);
+            LOG.error("Could not start InputReplay {} session; connecting without recording or replay", mode, e);
             session = null;
         }
         return false;
     }
 
     private static void startSession(Minecraft mc, Mode mode, ServerAddress address, ServerData data,
-                                     Path replayFile, boolean forcePhysical) throws Exception {
+                                     RecordingReader reader, boolean forcePhysical) throws Exception {
         String serverPart = address.getHost().replaceAll("[^A-Za-z0-9._-]", "_") + "_" + address.getPort();
         String base = LocalDateTime.now().format(FILE_TIME) + "_" + serverPart + (mode == Mode.REPLAY ? "_replay" : "");
         Path dir = recordingsDir();
@@ -157,8 +172,8 @@ public final class SessionManager {
         meta.addProperty("protocolVersion", SharedConstants.getProtocolVersion());
         meta.addProperty("loaderVersion", modVersion("fabricloader"));
         meta.addProperty("mode", mode == Mode.REPLAY ? "replay" : "record");
-        if (mode == Mode.REPLAY && replayFile != null) {
-            meta.addProperty("replayOf", replayFile.getFileName().toString());
+        if (mode == Mode.REPLAY) {
+            meta.addProperty("replayOf", reader.path.getFileName().toString());
         }
         JsonObject server = new JsonObject();
         server.addProperty("address", address.toString());
@@ -206,6 +221,7 @@ public final class SessionManager {
         d.addProperty("address", address.toString());
         s.event("SESSION_START", d);
         session = s;
+        if (mode == Mode.REPLAY) Replayer.attach(s, reader, forcePhysical);
         LOG.info("InputReplay {} session started: {}", mode, writer.partialDir());
     }
 
@@ -266,6 +282,7 @@ public final class SessionManager {
         if (reason != null) s.setEndReason(reason);
         InputCapture.flushCursor(s);
         boolean discard = s.channel == null && connection == null;
+        Replayer.onSessionEnd(s);
         s.finish(path -> {
             if (discard) {
                 LOG.info("Connection never established; discarding {}", path);
@@ -288,6 +305,7 @@ public final class SessionManager {
 
     /** {@code Minecraft.runTick} HEAD. */
     public static void onFrame() {
+        Replayer.onFrame(Minecraft.getInstance());
         Session s = session;
         if (s == null) return;
         s.clock.newFrame();
@@ -319,7 +337,9 @@ public final class SessionManager {
         detectChanges(s, mc);
         if (s.channel == null && connection == null && !(screen instanceof ConnectScreen) && tick > 20) {
             endSession("connect_failed");
+            return;
         }
+        Replayer.beforeTick(mc, s, tick);
     }
 
     private static void detectChanges(Session s, Minecraft mc) {
@@ -373,6 +393,7 @@ public final class SessionManager {
             s.emit(Stream.SNAPSHOTS, Records.SNAPSHOT, PlayerSnapshotter.snapshot(mc, p));
         }
         s.emit(Stream.INPUTS, Records.KEY_STATE, keyState(s, p));
+        Replayer.afterTick(mc, s, s.lastTick);
         s.clock.endTick();
         if (s.writer.takeOverflowNotice()) {
             JsonObject d = new JsonObject();
@@ -409,6 +430,12 @@ public final class SessionManager {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /** Absolute path, or a file name / relative path inside the recordings directory. */
+    public static Path resolveRecording(Path p) {
+        if (p.isAbsolute() || Files.exists(p)) return p;
+        return recordingsDir().resolve(p.toString());
+    }
 
     private static String modVersion(String id) {
         return FabricLoader.getInstance().getModContainer(id).map(c -> c.getMetadata().getVersion().getFriendlyString()).orElse("?");

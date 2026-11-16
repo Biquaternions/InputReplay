@@ -12,6 +12,7 @@ Accepts a finished ``.irr`` zip or a crashed ``.irr.partial`` directory.
                           [--phase play] [--no-payload] [--format jsonl|csv|text] [-o out.jsonl]
     irr_dump.py timeline  file.irr [--tick 100:250] [--class ...] [--exclude-class ...]
     irr_dump.py export-moveplayer file.irr [-o moves.csv]
+    irr_dump.py diff      a.irr b.irr [--tick 0:500] [--epsilon 0] [--ignore-class ...] [--strict]
 """
 from __future__ import annotations
 
@@ -536,6 +537,168 @@ def cmd_export_moveplayer(a) -> int:
     return 0
 
 
+DEFAULT_IGNORE = ["ServerboundChatPacket", "ServerboundChatCommandSignedPacket", "ServerboundChatCommandPacket",
+                  "ServerboundChatAckPacket", "ServerboundChatSessionUpdatePacket", "ServerboundKeepAlivePacket",
+                  "ServerboundPongPacket", "ServerboundClientInformationPacket", "ServerboundCustomPayloadPacket"]
+INPUT_TYPES = ("KEY", "TEXT", "CHAR", "MOUSE_BUTTON", "SCROLL", "CURSOR", "TURN")
+
+
+def _by_tick(items: Iterable[tuple[int, Any]], lo: int | None, hi: int | None) -> dict[int, list]:
+    out: dict[int, list] = defaultdict(list)
+    for tick, v in items:
+        if (lo is None or tick >= lo) and (hi is None or tick <= hi):
+            out[tick].append(v)
+    return out
+
+
+def _snapshots(rec: Recording) -> dict[int, dict]:
+    return {r.tick: r.data for r in rec.records("snapshots") if r.type == "SNAPSHOT"}
+
+
+def _outbound_keys(rec: Recording, ignore: list[str]) -> Iterator[tuple[int, tuple]]:
+    for r in sorted((r for r in rec.records("out") if r.type == "PACKET_OUT"), key=lambda r: r.seq):
+        cls = r.data["className"]
+        if any(fnmatch.fnmatchcase(cls, g) for g in ignore):
+            yield r.tick, (cls,)
+        else:
+            yield r.tick, (cls, r.data["summary"])
+
+
+def _input_keys(rec: Recording) -> Iterator[tuple[int, tuple]]:
+    for r in sorted(rec.records("inputs"), key=lambda r: r.seq):
+        if r.type in INPUT_TYPES:
+            # mappingNames depend on the current bindings; the cursor position of a click only
+            # matters inside screens and is not restored outside them
+            d = {k: v for k, v in r.data.items() if k not in ("mappingNames", "x", "y") or r.type == "CURSOR"}
+            yield r.tick, (r.type, json.dumps(d, sort_keys=True))
+
+
+def _key_states(rec: Recording) -> dict[int, tuple]:
+    return {r.tick: (tuple(r.data["down"]), tuple(r.data["input"])) for r in rec.records("inputs") if r.type == "KEY_STATE"}
+
+
+def _first_mismatch(a: dict[int, list], b: dict[int, list]) -> tuple[int, list, list] | None:
+    for t in sorted(set(a) | set(b)):
+        if a.get(t, []) != b.get(t, []):
+            return t, a.get(t, []), b.get(t, []),
+    return None
+
+
+def cmd_diff(a) -> int:
+    ra, rb = Recording(a.a), Recording(b_path := a.b)
+    lo, hi = parse_tick_range(a.tick)
+    lo = 0 if lo is None else lo
+    ignore = [] if a.strict else list(DEFAULT_IGNORE)
+    ignore += globs(a.ignore_class)
+    eps = a.epsilon
+    print(f"A: {a.a}  ({ra.meta.get('mode')}, {ra.meta.get('durationTicks')} ticks)")
+    print(f"B: {b_path}  ({rb.meta.get('mode')}, {rb.meta.get('durationTicks')} ticks"
+          f"{', replayOf ' + str(rb.meta.get('replayOf')) if rb.meta.get('replayOf') else ''}"
+          f"{', bindings ' + str(rb.meta.get('bindingMode')) if rb.meta.get('bindingMode') else ''})")
+    if hi is None:
+        da, db = ra.meta.get("durationTicks"), rb.meta.get("durationTicks")
+        if isinstance(da, int) and isinstance(db, int):
+            hi = min(da, db) - 1
+    print(f"Compared ticks: {lo}..{hi if hi is not None else 'end'}\n")
+    diverged = False
+
+    # --- snapshots
+    sa, sb = _snapshots(ra), _snapshots(rb)
+    ticks = sorted(t for t in set(sa) & set(sb) if t >= lo and (hi is None or t <= hi))
+    rows = []
+    first_snap = None
+    for t in ticks:
+        x, y = sa[t], sb[t]
+        dpos = ((x["x"] - y["x"]) ** 2 + (x["y"] - y["y"]) ** 2 + (x["z"] - y["z"]) ** 2) ** 0.5
+        dvel = ((x["vx"] - y["vx"]) ** 2 + (x["vy"] - y["vy"]) ** 2 + (x["vz"] - y["vz"]) ** 2) ** 0.5
+        drot = max(abs(x["yRot"] - y["yRot"]), abs(x["xRot"] - y["xRot"]))
+        other = [k for k in ("flags", "pose", "input", "lastSentInput", "selectedSlot", "heldItem", "vehicleId")
+                 if x.get(k) != y.get(k)]
+        bad = dpos > eps or dvel > eps or drot > eps or bool(other)
+        rows.append((t, dpos, dvel, drot, other, bad))
+        if bad and first_snap is None:
+            first_snap = t
+    missing = sorted(t for t in (set(sa) ^ set(sb)) if t >= lo and (hi is None or t <= hi))
+    print(f"Snapshots: {len(ticks)} common ticks, {len(missing)} ticks present in only one run")
+    if first_snap is None:
+        print("  identical" + (f" (epsilon {eps})" if eps else ""))
+    else:
+        diverged = True
+        n_bad = sum(1 for r in rows if r[5])
+        print(f"  FIRST DIVERGENCE at tick {first_snap}  ({n_bad} divergent ticks, max dpos {max(r[1] for r in rows):.6g})")
+        i0 = next(i for i, r in enumerate(rows) if r[0] == first_snap)
+        print(f"  {'tick':>7} {'dpos':>12} {'dvel':>12} {'drot':>10}  other")
+        for t, dpos, dvel, drot, other, bad in rows[max(0, i0 - a.context): i0 + a.context + 1]:
+            print(f"  {t:>7} {dpos:>12.6g} {dvel:>12.6g} {drot:>10.4g}  {','.join(other)}{'  <--' if t == first_snap else ''}")
+    print()
+
+    # --- outbound packets
+    oa, ob = _by_tick(_outbound_keys(ra, ignore), lo, hi), _by_tick(_outbound_keys(rb, ignore), lo, hi)
+    mm = _first_mismatch(oa, ob)
+    n_moves = sum(1 for l in oa.values() for k in l if k[0].startswith("ServerboundMovePlayerPacket"))
+    print(f"Outbound packets: {sum(map(len, oa.values()))} vs {sum(map(len, ob.values()))} "
+          f"({n_moves} MovePlayer in A; {len(ignore)} classes compared by class only)")
+    if mm is None:
+        print("  identical")
+    else:
+        diverged = True
+        t, la, lb = mm
+        print(f"  FIRST MISMATCH at tick {t}")
+        for side, l in (("A", la), ("B", lb)):
+            for k in l:
+                print(f"    {side}: {k[0]}  {k[1][:200] if len(k) > 1 else ''}")
+    print()
+
+    # --- inputs and key state
+    # per tick as a multiset: the replayer applies a tick's TURNs before its other events
+    ia = {t: sorted(l) for t, l in _by_tick(_input_keys(ra), lo, hi).items()}
+    ib = {t: sorted(l) for t, l in _by_tick(_input_keys(rb), lo, hi).items()}
+    mm = _first_mismatch(ia, ib)
+    ka, kb = _key_states(ra), _key_states(rb)
+    k_first = next((t for t in sorted(set(ka) & set(kb)) if t >= lo and (hi is None or t <= hi) and ka[t] != kb[t]), None)
+    print(f"Inputs: {sum(map(len, ia.values()))} vs {sum(map(len, ib.values()))} events")
+    if mm is None:
+        print("  identical")
+    else:
+        t, la, lb = mm
+        print(f"  first difference at tick {t}:")
+        for side, l in (("A", la), ("B", lb)):
+            for k in l[:8]:
+                print(f"    {side}: {k[0]} {k[1]}")
+    if k_first is None:
+        print("  key state: identical")
+    else:
+        print(f"  key state: first difference at tick {k_first}: A={ka[k_first]} B={kb[k_first]}")
+    print()
+
+    # --- inbound apply ticks
+    def applied(rec: Recording) -> dict[tuple[str, int], int | None]:
+        out, n = {}, Counter()
+        for r in sorted(rec.packets_in(), key=lambda r: r.seq):
+            if r.data["phase"] != "play":
+                continue
+            cls = r.data["className"]
+            out[(cls, n[cls])] = r.data["applyTick"]
+            n[cls] += 1
+        return out
+    pa, pb = applied(ra), applied(rb)
+    moved = [(k, pa[k], pb[k]) for k in pa.keys() & pb.keys()
+             if pa[k] is not None and pb[k] is not None and pa[k] != pb[k]
+             and pa[k] >= lo and (hi is None or pa[k] <= hi)
+             and not any(fnmatch.fnmatchcase(k[0], g) for g in globs(a.ignore_class))]
+    moved.sort(key=lambda m: (m[1], m[0]))
+    print(f"Inbound packets (play phase, matched by class + occurrence): {len(moved)} applied at a different tick")
+    focus = first_snap if first_snap is not None else None
+    shown = moved if focus is None else sorted(moved, key=lambda m: abs(m[1] - focus))
+    for (cls, idx), ta, tb in shown[:a.limit]:
+        print(f"  {cls}#{idx}: A applied @{ta}, B @{tb} ({tb - ta:+d})")
+    if len(moved) > a.limit:
+        print(f"  ... {len(moved) - a.limit} more (--limit)")
+    print()
+    print("RESULT: " + ("DIVERGED" if diverged else "no divergence in snapshots or outbound packets"))
+    return 1 if diverged else 0
+
+
 def add_filters(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tick", help="anchored tick range, e.g. 100:250, 100:, :50 or 42")
     p.add_argument("--class", dest="cls", help="comma-separated class-name globs to include (packets)")
@@ -573,6 +736,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("file")
     p.add_argument("-o", "--output")
     p.set_defaults(fn=cmd_export_moveplayer)
+
+    p = sub.add_parser("diff", help="compare two recordings (e.g. original vs. replay run) tick by tick")
+    p.add_argument("a")
+    p.add_argument("b")
+    p.add_argument("--tick", help="anchored tick range to compare (default: 0 .. shorter duration)")
+    p.add_argument("--epsilon", type=float, default=0.0, help="tolerance for position/velocity/rotation (default exact)")
+    p.add_argument("--ignore-class", dest="ignore_class", help="extra class globs compared by class+tick only")
+    p.add_argument("--strict", action="store_true", help="disable the default ignore list")
+    p.add_argument("--context", type=int, default=5, help="snapshot rows shown around the first divergence")
+    p.add_argument("--limit", type=int, default=20, help="inbound apply-tick changes shown")
+    p.set_defaults(fn=cmd_diff)
 
     a = ap.parse_args(argv)
     try:

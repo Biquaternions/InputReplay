@@ -1,5 +1,6 @@
 package me.biquaternions.inputreplay.client.gui;
 
+import me.biquaternions.inputreplay.client.io.RecordingReader;
 import me.biquaternions.inputreplay.client.session.Mode;
 import me.biquaternions.inputreplay.client.session.SessionManager;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -40,11 +41,10 @@ public class ModeSelectScreen extends Screen {
                 .bounds(x, y, w, 20)
                 .tooltip(Tooltip.create(Component.literal("Record inputs, packets and player state until you leave the server")))
                 .build());
-        Button replay = addRenderableWidget(Button.builder(Component.literal("Replay..."), b -> {})
+        addRenderableWidget(Button.builder(Component.literal("Replay..."), b -> minecraft.gui.setScreen(new RecordingListScreen(this)))
                 .bounds(x, y + 24, w, 20)
-                .tooltip(Tooltip.create(Component.literal("Replay engine: not implemented yet (step 2)")))
+                .tooltip(Tooltip.create(Component.literal("Pick a recording; the mod drives the player and records the run")))
                 .build());
-        replay.active = false;
         addRenderableWidget(Button.builder(Component.literal("Plain"), b -> connect(Mode.PLAIN, null, false))
                 .bounds(x, y + 48, w, 20)
                 .tooltip(Tooltip.create(Component.literal("Connect without recording")))
@@ -57,6 +57,12 @@ public class ModeSelectScreen extends Screen {
     /** Arms the chosen mode and re-invokes the connect that was intercepted. */
     public void connect(Mode mode, Path replayFile, boolean forcePhysical) {
         SessionManager.arm(mode, replayFile, forcePhysical);
+        ConnectScreen.startConnecting(parent, minecraft, address, data, quickPlay, transfer);
+    }
+
+    /** Arms a replay of an already loaded recording and re-invokes the intercepted connect. */
+    public void connectReplay(RecordingReader reader, boolean forcePhysical) {
+        SessionManager.armReplay(reader, forcePhysical);
         ConnectScreen.startConnecting(parent, minecraft, address, data, quickPlay, transfer);
     }
 

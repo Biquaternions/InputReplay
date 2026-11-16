@@ -141,3 +141,107 @@ take precedence. A session whose connection was never established is discarded.
 - `/inputreplay prompt on|off` and `/inputreplay status`.
 - `tools/start-test-server.sh` sets up `run/server/` as described in §9 (running it accepts the
   Minecraft EULA).
+
+## Step 2: replay engine (phase 4)
+
+### Input blocking starts at tick 0, not at connect (§3.3)
+
+Blocking hardware input from the moment the replay is armed would also block the connect screen
+(cancel button, Escape) during login and configuration. Replayed inputs only start at tick 0 anyway.
+
+**Change:** `InputGate.replayActive` is switched on at the first anchored tick with a player, and
+off when the replay completes, aborts or pauses.
+
+### Pre-anchor inputs are not replayed; held keys are restored (§7.1)
+
+Inputs with negative anchored ticks were made on the connect / loading screens. Replaying them
+would click into screens that may not exist at the same moment in the new run.
+
+**Change:** they are skipped. At tick 0 the replayer calls `KeyMapping.releaseAll()` (dropping
+anything physically held), then sets down every mapping that was down in the recording's last
+pre-anchor `KEY_STATE`. A key held through the world loading in the original run is therefore
+held at tick 0 in the replay too; its release is a normal recorded event.
+
+### Pause on focus loss is disabled during a replay (§2.4)
+
+With `pauseOnLostFocus`, alt-tabbing during a replay opens the pause screen and breaks the run,
+because the original run had no such screen.
+
+**Change:** `Options.pauseOnLostFocus` is set to false for the duration of the replay and restored
+afterwards.
+
+### End of replay and abort (§7.3)
+
+- The disconnect at the recorded end is requested at tick start but performed from the
+  `Minecraft.runTick` HEAD hook, so it happens outside any tick (the same context as the pause-menu
+  Disconnect button).
+- The abort key (and `/inputreplay stop`) stops the replay and finalizes the replay recording, but
+  **stays connected** so the state can be inspected. The plan only said "finalize".
+- `pauseOnDrift` cannot freeze the server, so "pause" means: stop driving, release all keys and give
+  control back to the user. The recording continues until disconnect with
+  `endReason = "paused_on_drift"`.
+- Disconnects not caused by the replayer end with `server_disconnect_during_replay` (a
+  disconnect packet was seen) or `disconnect_during_replay`.
+
+### By-name injection details (§7.1)
+
+- With no screen open, events carrying mapping names call `setDown` and increment `clickCount`
+  directly. The `KeyMapping.set`/`click` bytecode in 26.3 does exactly that. Because these calls
+  bypass the input mixins, the original record is re-emitted into the replay recording unchanged.
+- Some keys are handled inside `KeyboardHandler.keyPress` through `KeyMapping.matches(KeyEvent)`
+  rather than `isDown`/`consumeClick` (screenshot, fullscreen, hide GUI, spectator shader). Under
+  by-name injection with no screen open these do not fire. They are cosmetic and do not affect
+  physics.
+- Events recorded **without** mapping names are injected physically, except when that physical key
+  is bound to a mapping in the current client while no screen is open. Injecting it would trigger
+  a mapping the original run never triggered, so such events are skipped (logged once per key).
+- Mouse buttons while a screen is open are always injected physically at the recorded cursor
+  position (GUI clicks are positional).
+
+### Turns are applied before the other events of a tick (§7.1)
+
+As in the plan, all TURNs tagged N are applied before the key/mouse events tagged N, so within a
+tick the replay order can differ from the original seq order. The replayer records each TURN
+itself (it calls `LocalPlayer.turn` directly, bypassing the `turnPlayer` hook).
+
+### Not implemented: the `KEY_STATE` state-override fallback (§5.4)
+
+The plan offers forcing `player.input.keyPresses` from `KEY_STATE` "if events alone prove
+insufficient". It is not implemented until a real replay shows it is needed; `diff` reports
+key-state differences so that it can be judged.
+
+### `irr_dump.py diff` moved up from phase 5 (§8, §11)
+
+The phase 4 acceptance test needs it. Details:
+
+- Default tick range: 0 to the shorter recording's duration minus one.
+- Snapshots: exact by default (`--epsilon` to relax). Compares position, velocity, rotation, and
+  flags, pose, input bits, slot, held item and vehicle.
+- Outbound packets: per tick, in seq order, by class and summary. The default ignore list (and
+  `--ignore-class`) compares those classes by class and tick only. `--strict` disables the list.
+- Inputs: per tick as a multiset (see "Turns are applied before..."), ignoring `mappingNames`
+  (binding-dependent) and the cursor position of clicks (only restored inside screens). Key states
+  are compared per tick.
+- Inbound packets are matched across runs by (class, occurrence index) in the play phase, and
+  listed when their apply tick changed, closest to the first snapshot divergence first.
+- Exit code 1 when snapshots or outbound packets diverge, so it can gate scripted runs.
+
+### Recording list screen and commands (§3.1, §9)
+
+- The list is a page of row buttons with Replay / Replay (physical) / Delete / Back. Delete asks for
+  a second click. Crashed `.partial` recordings are listed too and can be replayed.
+- The recording is loaded and validated when Replay is clicked (errors are shown on the screen), and
+  the loaded reader is handed to the session. When the replay is armed by command or system property,
+  it is loaded at connect time, and a failure is logged and the connection proceeds without a session.
+- The list warns about option differences (toggle sneak/sprint/attack/use, auto-jump, GUI scale) and
+  about a recording made on a different server address. The plan's "user can override" for option
+  mismatches is simply proceeding despite the warning.
+- `/inputreplay replay <file> [physical]` (file name in the recordings directory, or a quoted
+  path) and `/inputreplay stop`.
+
+### Additional metadata and events
+
+`metadata.bindingMode`, `metadata.replayDurationTicks`, `metadata.replaySummary` (compared ticks, max
+Δpos, first divergent tick, missing mappings). Events: `REPLAY_ARMED`, `REPLAY_STARTED`
+(`heldAtStart`), `REPLAY_COMPLETE`, `REPLAY_ABORTED`, `REPLAY_PAUSED_ON_DRIFT`, `REPLAY_SUMMARY`,
+`BINDING_MISMATCH`, `OPTION_MISMATCH`.

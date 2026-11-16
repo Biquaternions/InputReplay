@@ -1,6 +1,9 @@
 package me.biquaternions.inputreplay.client;
 
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import me.biquaternions.inputreplay.client.replay.Replayer;
+import net.minecraft.commands.SharedSuggestionProvider;
 import com.mojang.brigadier.context.CommandContext;
 import me.biquaternions.inputreplay.client.gui.SessionHud;
 import me.biquaternions.inputreplay.client.session.Mode;
@@ -22,8 +25,13 @@ import net.minecraft.resources.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.stream.Stream;
 
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.argument;
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal;
 
 public class InputreplayClient implements ClientModInitializer {
@@ -83,6 +91,23 @@ public class InputreplayClient implements ClientModInitializer {
         d.register(literal("inputreplay")
                 .then(literal("record").executes(c -> arm(c, Mode.RECORD)))
                 .then(literal("plain").executes(c -> arm(c, Mode.PLAIN)))
+                .then(literal("replay")
+                        .then(argument("file", StringArgumentType.string())
+                                .suggests((c, b) -> SharedSuggestionProvider.suggest(recordingNames(), b))
+                                .executes(c -> armReplay(c, false))
+                                .then(literal("physical").executes(c -> armReplay(c, true)))))
+                .then(literal("stop").executes(c -> {
+                    if (Replayer.active() != null) {
+                        Replayer.active().abort("aborted");
+                    } else if (SessionManager.session() != null) {
+                        SessionManager.endSession("stopped_by_command");
+                    } else {
+                        c.getSource().sendError(Component.literal("No session"));
+                        return 0;
+                    }
+                    c.getSource().sendFeedback(Component.literal("InputReplay: session ended (still connected)"));
+                    return 1;
+                }))
                 .then(literal("off").executes(c -> {
                     SessionManager.disarm();
                     c.getSource().sendFeedback(Component.literal("InputReplay: disarmed (the prompt will be shown on connect if enabled)"));
@@ -113,6 +138,27 @@ public class InputreplayClient implements ClientModInitializer {
         SessionManager.arm(mode, null, false);
         c.getSource().sendFeedback(Component.literal("InputReplay: armed " + mode + " for the next connection"));
         return 1;
+    }
+
+    private static int armReplay(CommandContext<FabricClientCommandSource> c, boolean physical) {
+        Path p = SessionManager.resolveRecording(Path.of(StringArgumentType.getString(c, "file")));
+        if (!Files.exists(p)) {
+            c.getSource().sendError(Component.literal("No such recording: " + p));
+            return 0;
+        }
+        SessionManager.arm(Mode.REPLAY, p, physical);
+        c.getSource().sendFeedback(Component.literal("InputReplay: armed replay of " + p.getFileName()
+                + (physical ? " (physical keys)" : "") + " for the next connection"));
+        return 1;
+    }
+
+    private static List<String> recordingNames() {
+        try (Stream<Path> s = Files.list(SessionManager.recordingsDir())) {
+            return s.map(p -> p.getFileName().toString()).filter(n -> n.endsWith(".irr") || n.endsWith(".irr.partial"))
+                    .map(n -> '"' + n + '"').sorted().toList();
+        } catch (IOException e) {
+            return List.of();
+        }
     }
 
     private static int setPrompt(CommandContext<FabricClientCommandSource> c, boolean on) {

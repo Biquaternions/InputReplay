@@ -145,7 +145,10 @@ str heldItem                         item id, empty if nothing held
 Names: `SESSION_START`, `CONNECTED`, `PLAYER_LOADED` (`rawTick`, `anchorSeq`), `RESPAWN`,
 `DIMENSION_CHANGE`, `SCREEN_OPEN` / `SCREEN_CLOSE` (`screen`), `WINDOW_RESIZE`, `TICKRATE_CHANGE`,
 `TRANSFER`, `TRANSFER_OLD_CONNECTION_CLOSED`, `DISCONNECT` (`reason`, `byServer`), `QUEUE_OVERFLOW`,
-`SESSION_END` (`reason`); replay runs add `REPLAY_*` and `BINDING_MISMATCH`.
+`SESSION_END` (`reason`). Replay runs add `REPLAY_ARMED` (`file`, `bindingMode`, `durationTicks`),
+`REPLAY_STARTED` (`heldAtStart`), `REPLAY_COMPLETE`, `REPLAY_ABORTED` (`reason`, `tick`),
+`REPLAY_PAUSED_ON_DRIFT` (`tick`, `dpos`), `REPLAY_SUMMARY`, `BINDING_MISMATCH` (`mappings`) and
+`OPTION_MISMATCH` (`options`).
 
 ## `options.txt`
 
