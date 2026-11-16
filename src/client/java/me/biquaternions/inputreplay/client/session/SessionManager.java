@@ -57,6 +57,7 @@ public final class SessionManager {
     private static Path armedReplayFile;
     private static boolean armedForcePhysical;
     private static RecordingReader armedReader;
+    private static boolean armedSync;
     private static volatile Session session;
     private static volatile Connection connection;
     private static Path lastFinished;
@@ -90,15 +91,20 @@ public final class SessionManager {
     }
 
     public static void arm(Mode mode, Path replayFile, boolean forcePhysical) {
+        arm(mode, replayFile, forcePhysical, false);
+    }
+
+    public static void arm(Mode mode, Path replayFile, boolean forcePhysical, boolean sync) {
         armedMode = mode;
         armedReplayFile = replayFile;
         armedForcePhysical = forcePhysical;
+        armedSync = sync;
         armedReader = null;
     }
 
     /** Arms a replay with a recording that was already loaded (and validated) by the list screen. */
-    public static void armReplay(RecordingReader reader, boolean forcePhysical) {
-        arm(Mode.REPLAY, reader.path, forcePhysical);
+    public static void armReplay(RecordingReader reader, boolean forcePhysical, boolean sync) {
+        arm(Mode.REPLAY, reader.path, forcePhysical, sync);
         armedReader = reader;
     }
 
@@ -135,6 +141,7 @@ public final class SessionManager {
         Path replayFile = armedReplayFile;
         boolean forcePhysical = armedForcePhysical;
         RecordingReader reader = armedReader;
+        boolean sync = armedSync;
         disarm();
         if (s != null && !s.ended()) endSession("superseded");
         if (mode == Mode.PLAIN) return false;
@@ -143,7 +150,7 @@ public final class SessionManager {
                 if (replayFile == null) throw new IllegalStateException("replay armed without a file");
                 reader = new RecordingReader(resolveRecording(replayFile));
             }
-            startSession(mc, mode, address, data, reader, forcePhysical);
+            startSession(mc, mode, address, data, reader, forcePhysical, sync);
         } catch (Exception e) {
             LOG.error("Could not start InputReplay {} session; connecting without recording or replay", mode, e);
             session = null;
@@ -152,7 +159,7 @@ public final class SessionManager {
     }
 
     private static void startSession(Minecraft mc, Mode mode, ServerAddress address, ServerData data,
-                                     RecordingReader reader, boolean forcePhysical) throws Exception {
+                                     RecordingReader reader, boolean forcePhysical, boolean sync) throws Exception {
         String serverPart = address.getHost().replaceAll("[^A-Za-z0-9._-]", "_") + "_" + address.getPort();
         String base = LocalDateTime.now().format(FILE_TIME) + "_" + serverPart + (mode == Mode.REPLAY ? "_replay" : "");
         Path dir = recordingsDir();
@@ -221,7 +228,7 @@ public final class SessionManager {
         d.addProperty("address", address.toString());
         s.event("SESSION_START", d);
         session = s;
-        if (mode == Mode.REPLAY) Replayer.attach(s, reader, forcePhysical);
+        if (mode == Mode.REPLAY) Replayer.attach(s, reader, forcePhysical, sync);
         LOG.info("InputReplay {} session started: {}", mode, writer.partialDir());
     }
 

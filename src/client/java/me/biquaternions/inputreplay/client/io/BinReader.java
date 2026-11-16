@@ -88,6 +88,12 @@ public final class BinReader {
         return out;
     }
 
+    public void skipBytes() {
+        int n = (int) uvarint();
+        if (p + n > end) throw new IndexOutOfBoundsException();
+        p += n;
+    }
+
     public String str() {
         int n = (int) uvarint();
         if (p + n > end) throw new IndexOutOfBoundsException();

@@ -89,6 +89,12 @@ public final class InputCapture {
         boolean relevant = mc.gui.screen() != null || mc.mouseHandler.isLeftPressed()
                 || mc.mouseHandler.isRightPressed() || mc.mouseHandler.isMiddlePressed();
         if (!relevant) return;
+        if (me.biquaternions.inputreplay.client.replay.InputGate.injecting) {
+            // a replayed move: keep each one, like the source recording has them
+            flushCursor(s);
+            s.emit(Stream.INPUTS, Records.CURSOR, new Bin(32).f64(x).f64(y).f64(dx).f64(dy));
+            return;
+        }
         long frame = s.clock.frame();
         if (pendingCursor != null && pendingCursorFrame != frame) flushCursor(s);
         if (pendingCursor == null) {

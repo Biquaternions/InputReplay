@@ -8,6 +8,8 @@ import me.biquaternions.inputreplay.client.capture.InputCapture;
 import me.biquaternions.inputreplay.client.io.RecordingReader;
 import me.biquaternions.inputreplay.client.io.RecordingReader.InputRec;
 import me.biquaternions.inputreplay.client.io.Records;
+import me.biquaternions.inputreplay.client.mixin.client.KeyMappingAccessor;
+import com.mojang.blaze3d.platform.InputConstants;
 import me.biquaternions.inputreplay.client.session.BindingResolver;
 import me.biquaternions.inputreplay.client.session.Session;
 import me.biquaternions.inputreplay.client.session.SessionManager;
@@ -30,13 +32,14 @@ import java.util.List;
  */
 public final class Replayer {
     private static final Logger LOG = LoggerFactory.getLogger("InputReplay/Replayer");
-    private static Replayer active;
+    private static volatile Replayer active;
 
     private final Session session;
     private final RecordingReader rec;
     private final InputInjector injector;
     private final DriftMonitor drift = new DriftMonitor(Config.get().driftThreshold);
     private final List<String> bindingDiff;
+    private final PacketSync packetSync;
     private boolean started;
     private boolean finished;
     private boolean paused;
@@ -52,7 +55,7 @@ public final class Replayer {
         };
     }
 
-    private Replayer(Session session, RecordingReader rec, boolean forcePhysical) {
+    private Replayer(Session session, RecordingReader rec, boolean forcePhysical, boolean sync) {
         this.session = session;
         this.rec = rec;
         BindingResolver.Snapshot recorded = BindingResolver.parse(rec.optionsText);
@@ -60,6 +63,16 @@ public final class Replayer {
         InputInjector.BindingMode mode = forcePhysical || bindingDiff.isEmpty()
                 ? InputInjector.BindingMode.PHYSICAL : InputInjector.BindingMode.BY_NAME;
         this.injector = new InputInjector(mode, session);
+        PacketSync ps = null;
+        if (sync) {
+            try {
+                ps = new PacketSync(session, rec.loadPlayerPackets());
+            } catch (Exception e) {
+                LOG.error("Cannot load player packets of {}; replaying without packet sync", rec.path, e);
+            }
+        }
+        this.packetSync = ps;
+        session.metadata.addProperty("replaySync", ps != null);
 
         session.metadata.addProperty("bindingMode", mode == InputInjector.BindingMode.PHYSICAL ? "physical" : "byName");
         session.metadata.addProperty("replayDurationTicks", rec.durationTicks);
@@ -68,6 +81,7 @@ public final class Replayer {
         d.addProperty("file", rec.path.getFileName().toString());
         d.addProperty("bindingMode", mode.name());
         d.addProperty("forcedPhysical", forcePhysical);
+        d.addProperty("packetSync", ps != null);
         d.addProperty("durationTicks", rec.durationTicks);
         session.event("REPLAY_ARMED", d);
         if (!bindingDiff.isEmpty()) {
@@ -89,9 +103,36 @@ public final class Replayer {
         LOG.info("Replay armed: {} ({} ticks, bindings {})", rec.path.getFileName(), rec.durationTicks, mode);
     }
 
-    public static void attach(Session session, RecordingReader rec, boolean forcePhysical) {
+    public static void attach(Session session, RecordingReader rec, boolean forcePhysical, boolean sync) {
         if (active != null) active.stop();
-        active = new Replayer(session, rec, forcePhysical);
+        active = new Replayer(session, rec, forcePhysical, sync);
+    }
+
+    // ---------------------------------------------------------------- packet sync hooks
+
+    /** Netty thread, for every decoded inbound packet of the session connection. */
+    public static void syncOnDecoded(net.minecraft.network.protocol.Packet<?> packet, String className, String phase, String summary) {
+        Replayer r = active;
+        if (r != null && r.packetSync != null && !r.finished) r.packetSync.onDecoded(packet, className, phase, summary);
+    }
+
+    /** True if sync wants this player packet's summary (avoids summarizing everything). */
+    public static boolean syncWantsSummary(String className) {
+        Replayer r = active;
+        return r != null && r.packetSync != null && !r.packetSync.disabled()
+                && (me.biquaternions.inputreplay.client.capture.PlayerPackets.isCandidate(className) || className.equals("ClientboundLoginPacket"));
+    }
+
+    /** Main thread, ListenerAndPacket.handle HEAD: true if the packet is held for a later tick. */
+    public static boolean syncOnHandle(net.minecraft.network.protocol.Packet<?> packet, Runnable handle) {
+        Replayer r = active;
+        return r != null && r.packetSync != null && r.packetSync.onHandle(packet, handle);
+    }
+
+    /** Main thread, before Minecraft.tick() in runTick: true to skip this tick. */
+    public static boolean shouldStallTick() {
+        Replayer r = active;
+        return r != null && r.packetSync != null && !r.finished && r.packetSync.shouldStall();
     }
 
     public static Replayer active() {
@@ -140,6 +181,7 @@ public final class Replayer {
         if (finished || paused || !session.clock.anchored()) return;
         int n = session.clock.anchored(rawTick);
         currentTick = n;
+        if (packetSync != null) packetSync.releaseDue(n);
         LocalPlayer player = mc.player;
         if (player == null) {
             if (++nullPlayerTicks > Config.get().maxNullPlayerTicks) abort("player_missing");
@@ -193,6 +235,7 @@ public final class Replayer {
         savedPauseOnLostFocus = mc.options.pauseOnLostFocus;
         mc.options.pauseOnLostFocus = false; // a pause screen opening on focus loss would break the run
         KeyMapping.releaseAll();
+        VirtualKeyboard.clear();
         // Keys that were held while the world was loading in the original run.
         List<String> held = new ArrayList<>();
         if (rec.preAnchorKeyBits != null) {
@@ -205,6 +248,8 @@ public final class Replayer {
                     KeyMapping m = KeyMapping.get(names.get(i).getAsString());
                     if (m != null) {
                         m.setDown(true);
+                        InputConstants.Key k = ((KeyMappingAccessor) m).inputreplay$getKey();
+                        if (k.getType() == InputConstants.Type.KEYBOARD) VirtualKeyboard.set(k.getValue(), true);
                         held.add(m.getName());
                     }
                 }
@@ -239,8 +284,10 @@ public final class Replayer {
     }
 
     private void release(Minecraft mc) {
+        if (packetSync != null) packetSync.releaseAll();
         if (InputGate.replayActive) {
             InputGate.replayActive = false;
+            VirtualKeyboard.clear();
             KeyMapping.releaseAll();
             mc.options.pauseOnLostFocus = savedPauseOnLostFocus;
         }
@@ -262,6 +309,7 @@ public final class Replayer {
             injector.missingMappings.forEach(arr::add);
             d.add("missingMappings", arr);
         }
+        if (packetSync != null) d.add("packetSync", packetSync.summary());
         session.event("REPLAY_SUMMARY", d);
         session.metadata.add("replaySummary", d);
     }
@@ -272,11 +320,13 @@ public final class Replayer {
         String state = paused ? "PAUSED (drift)" : finished ? "done" : started ? "F10 abort" : "waiting for player";
         String bind = injector.mode() == InputInjector.BindingMode.PHYSICAL ? "physical" : "byName";
         String first = drift.firstDivergentTick < 0 ? "none" : String.valueOf(drift.firstDivergentTick);
-        return List.of(
+        List<String> lines = new ArrayList<>(List.of(
                 String.format("REPLAY  tick %d / %d   Δpos %.4f  Δvel %.4f  Δrot %.3f   bindings: %s",
                         Math.max(currentTick, 0), rec.durationTicks, nanToZero(drift.lastDpos), nanToZero(drift.lastDvel),
                         nanToZero(drift.lastDrot), bind),
-                String.format("max Δpos %.4f   first divergence: %s   [%s]", drift.maxDpos, first, state));
+                String.format("max Δpos %.4f   first divergence: %s   [%s]", drift.maxDpos, first, state)));
+        if (packetSync != null) lines.add(packetSync.hudLine());
+        return lines;
     }
 
     private static double nanToZero(double d) {

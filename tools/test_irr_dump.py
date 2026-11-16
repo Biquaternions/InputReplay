@@ -265,9 +265,10 @@ class IrrDumpTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("FIRST DIVERGENCE at tick 4", out)
         self.assertIn("FIRST MISMATCH at tick 4", out)
-        # keep-alive ids differ from tick 0 on, but the class-only comparison (default ignore list) means
-        # the first outbound mismatch is the MovePlayer change at tick 4, and keep-alives show no summary
-        self.assertIn("A: ServerboundKeepAlivePacket  \n", out)
+        # keep-alive ids differ from tick 0 on; ignored classes are left out of the per-tick sequence
+        # (only counted), so the first outbound mismatch is the MovePlayer change at tick 4
+        self.assertNotIn("A: ServerboundKeepAlivePacket", out)
+        self.assertIn("not compared (timing-dependent, --strict to include): ServerboundKeepAlivePacket 6 vs 6", out)
         code, out = run("diff", a, c, "--tick", "0:3")
         self.assertEqual(code, 0, out)
         code, out = run("diff", a, c, "--epsilon", "0.01")
@@ -277,6 +278,43 @@ class IrrDumpTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("ServerboundKeepAlivePacket", out)
 
+    def test_diff_keepalive_in_other_tick_is_not_a_mismatch(self):
+        a = Builder().standard()
+        b = Builder().standard()
+        # move B's keep-alive of tick 1 to tick 2 (server-driven timing)
+        b.recs["out"] = [(rt, sq, t, (tk + 1 if b"KeepAlive" in f and tk == 1 + b.anchor else tk), fr, f)
+                         for rt, sq, t, tk, fr, f in b.recs["out"]]
+        code, out = run("diff", a.write_zip(self.p("a.irr")), b.write_zip(self.p("b.irr")))
+        self.assertEqual(code, 0, out)
+
+    def test_diff_player_packets(self):
+        def build(motion_tick: int) -> Builder:
+            b = Builder().standard()
+            b.packet_in(-1, 50, "ClientboundLoginPacket", b"\x2b", -1)
+            b.recs["in"][-2] = b.recs["in"][-2][:5] + (uv(50) + s_("play") + sv(0x2B) + s_("ClientboundLoginPacket") + sv(-1)
+                                                       + uv(1) + bytes([1]) + s_("ClientboundLoginPacket[playerId=108, hardcore=false]")
+                                                       + by(b"\x2b"),)
+            # login must come first in receive order: give it the lowest pid among play packets
+            b.add("in", 20, 2 + b.anchor, uv(300) + s_("play") + sv(0x5E) + s_("ClientboundSetEntityMotionPacket") + sv(-1) + uv(8)
+                  + bytes([1]) + s_("ClientboundSetEntityMotionPacket[id=108, movement=(0.0, -0.0784, 0.0)]") + by(bytes(8)))
+            b.add("in", 21, motion_tick + b.anchor, uv(300))
+            b.add("in", 20, 2 + b.anchor, uv(301) + s_("play") + sv(0x5E) + s_("ClientboundSetEntityMotionPacket") + sv(-1) + uv(8)
+                  + bytes([1]) + s_("ClientboundSetEntityMotionPacket[id=7, movement=(0.0, 0.0, 0.0)]") + by(bytes(8)))
+            b.add("in", 21, 2 + b.anchor, uv(301))
+            b.add("in", 20, 3 + b.anchor, uv(302) + s_("play") + sv(0x41) + s_("ClientboundPlayerPositionPacket") + sv(-1) + uv(8)
+                  + bytes([1]) + s_("ClientboundPlayerPositionPacket[id=3, change=...]") + by(bytes(8)))
+            b.add("in", 21, 3 + b.anchor, uv(302))
+            return b
+        fa = build(2).write_zip(self.p("a.irr"))
+        fb = build(3).write_zip(self.p("b.irr"))
+        self.assertEqual([r.data["className"] for r in irr_dump.player_packets(irr_dump.Recording(fa))],
+                         ["ClientboundSetEntityMotionPacket", "ClientboundPlayerPositionPacket"])  # id=7 is not the player
+        code, out = run("diff", fa, fb)
+        self.assertIn("Player packets (velocity, teleport, attributes, effects, entity data, explosions): 2 vs 2", out)
+        self.assertIn("#0 ClientboundSetEntityMotionPacket: A applied @2, B @3 (+1)", out)
+        code, out = run("diff", fa, fa)
+        self.assertIn("all applied at the same tick", out)
+
     def test_diff_apply_tick_moved(self):
         a = Builder().standard()
         b = Builder()
@@ -285,7 +323,7 @@ class IrrDumpTest(unittest.TestCase):
             b.packet_in(t, 100 + t, "ClientboundSetEntityMotionPacket", bytes([0x40, t]), t + (1 if t == 2 else 0))
             b.snapshot(t, 1.0 + t * 0.1, vy=-0.08)
         fa, fb = a.write_zip(self.p("a.irr")), b.write_zip(self.p("b.irr"))
-        code, out = run("diff", fa, fb)
+        code, out = run("diff", fa, fb, "--all-inbound")
         self.assertIn("ClientboundSetEntityMotionPacket#2: A applied @2, B @3 (+1)", out)
 
     def test_strip(self):

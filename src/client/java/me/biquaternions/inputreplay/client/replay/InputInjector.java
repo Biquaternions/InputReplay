@@ -60,6 +60,7 @@ public final class InputInjector {
         switch (r.type()) {
             case Records.KEY -> {
                 if (mode == BindingMode.BY_NAME && injectKeyByName(mc, window, r)) return;
+                trackKey(r.key(), r.action());
                 mc.keyboardHandler.keyPress(window, r.action(), new KeyEvent(r.key(), r.scancode(), r.modifiers()));
             }
             case Records.MOUSE_BUTTON -> {
@@ -83,9 +84,21 @@ public final class InputInjector {
         acc.inputreplay$setYpos(y);
     }
 
+    /** SDL reports a key as down from its press event until its release event. */
+    private static void trackKey(int key, int action) {
+        if (action == InputConstants.PRESS) VirtualKeyboard.set(key, true);
+        else if (action == InputConstants.RELEASE) VirtualKeyboard.set(key, false);
+    }
+
+    /** Ctrl / Shift / Alt / GUI (left and right): polled by fixed key code, so tracked by recorded code. */
+    static boolean isModifier(int key) {
+        return key >= 224 && key <= 231; // SDL scancodes LCTRL..RGUI
+    }
+
     /** Returns true if handled; false to fall back to physical injection. */
     private boolean injectKeyByName(Minecraft mc, long window, InputRec r) {
         List<String> names = r.mappingNames();
+        if (isModifier(r.key()) && !names.isEmpty()) trackKey(r.key(), r.action());
         if (names.isEmpty()) {
             return skipIfShadowed(mc, InputConstants.Type.KEYBOARD.getOrCreate(r.key()));
         }
@@ -97,6 +110,7 @@ public final class InputInjector {
                 mc.mouseHandler.onButton(window, new MouseButtonInfo(k.getValue(), r.modifiers()), r.action());
             } else if (!m.isUnbound()) {
                 int scancode = k.getValue() == r.key() ? r.scancode() : 0;
+                trackKey(k.getValue(), r.action());
                 mc.keyboardHandler.keyPress(window, r.action(), new KeyEvent(k.getValue(), scancode, r.modifiers()));
             } else {
                 LOG.warn("{} is unbound in this client; cannot route it to the open screen", m.getName());
@@ -149,6 +163,8 @@ public final class InputInjector {
                 continue;
             }
             m.setDown(down);
+            InputConstants.Key bound = ((KeyMappingAccessor) m).inputreplay$getKey();
+            if (bound.getType() == InputConstants.Type.KEYBOARD) VirtualKeyboard.set(bound.getValue(), down);
             if (down) {
                 KeyMappingAccessor acc = (KeyMappingAccessor) m;
                 acc.inputreplay$setClickCount(acc.inputreplay$getClickCount() + 1);

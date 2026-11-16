@@ -4,6 +4,7 @@ import io.netty.channel.Channel;
 import me.biquaternions.inputreplay.client.io.Bin;
 import me.biquaternions.inputreplay.client.io.Records;
 import me.biquaternions.inputreplay.client.io.Records.Stream;
+import me.biquaternions.inputreplay.client.replay.Replayer;
 import me.biquaternions.inputreplay.client.session.Session;
 import me.biquaternions.inputreplay.client.session.SessionManager;
 import net.minecraft.network.protocol.BundleDelimiterPacket;
@@ -75,9 +76,12 @@ public final class PacketCapture {
             }
         }
         PacketSummarizer.Policy policy = PacketSummarizer.policy(cls);
+        boolean syncWants = Replayer.syncWantsSummary(cls);
+        String summary = policy != PacketSummarizer.Policy.SKIP || syncWants ? PacketSummarizer.summary(packet) : "";
+        if (syncWants) Replayer.syncOnDecoded(packet, cls, phase, summary);
         Bin b = new Bin(raw.length + 128);
         b.uvarint(pid).str(phase).svarint(PacketSummarizer.packetId(raw)).str(cls).svarint(bIdx).uvarint(raw.length);
-        writeContent(b, policy, packet, raw);
+        writeContent(b, policy, summary, raw);
         s.inPackets.incrementAndGet();
         s.emit(Stream.PACKETS_IN, Records.PACKET_IN, b);
     }
@@ -131,15 +135,16 @@ public final class PacketCapture {
         String cls = PacketSummarizer.className(packet);
         Bin b = new Bin(bytes.length + 128);
         b.str(phase).svarint(PacketSummarizer.packetId(bytes)).str(cls).uvarint(bytes.length).bool(stamped);
-        writeContent(b, PacketSummarizer.policy(cls), packet, bytes);
+        PacketSummarizer.Policy policy = PacketSummarizer.policy(cls);
+        writeContent(b, policy, policy == PacketSummarizer.Policy.SKIP ? "" : PacketSummarizer.summary(packet), bytes);
         s.outPackets.incrementAndGet();
         s.emit(Stream.PACKETS_OUT, Records.PACKET_OUT, stamp[0], stamp[1], (int) stamp[2], stamp[3], b);
     }
 
-    private static void writeContent(Bin b, PacketSummarizer.Policy policy, Packet<?> packet, byte[] bytes) {
+    private static void writeContent(Bin b, PacketSummarizer.Policy policy, String summary, byte[] bytes) {
         switch (policy) {
-            case FULL -> b.u8(Records.PAYLOAD_FULL).str(PacketSummarizer.summary(packet)).bytes(bytes);
-            case SUMMARY -> b.u8(Records.PAYLOAD_NONE).str(PacketSummarizer.summary(packet)).bytes(null);
+            case FULL -> b.u8(Records.PAYLOAD_FULL).str(summary).bytes(bytes);
+            case SUMMARY -> b.u8(Records.PAYLOAD_NONE).str(summary).bytes(null);
             case SKIP -> b.u8(Records.PAYLOAD_NONE).str("").bytes(null);
         }
     }

@@ -41,6 +41,8 @@ public final class Config {
     public double driftThreshold = 0.001;
     /** Pause the replay when position drift exceeds {@link #driftThreshold}. */
     public boolean pauseOnDrift = false;
+    /** Packet-sync replay: give up syncing when a player packet is this late (ms of stalled ticks). */
+    public long syncTimeoutMs = 3000;
     /** Abort a replay when {@code minecraft.player} has been null for this many ticks. */
     public int maxNullPlayerTicks = 200;
 

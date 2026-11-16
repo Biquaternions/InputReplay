@@ -61,8 +61,8 @@ public class ModeSelectScreen extends Screen {
     }
 
     /** Arms a replay of an already loaded recording and re-invokes the intercepted connect. */
-    public void connectReplay(RecordingReader reader, boolean forcePhysical) {
-        SessionManager.armReplay(reader, forcePhysical);
+    public void connectReplay(RecordingReader reader, boolean forcePhysical, boolean sync) {
+        SessionManager.armReplay(reader, forcePhysical, sync);
         ConnectScreen.startConnecting(parent, minecraft, address, data, quickPlay, transfer);
     }
 

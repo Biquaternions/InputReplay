@@ -285,3 +285,73 @@ epsilon, tick range, ignore list vs `--strict`, moved apply ticks) and `strip`. 
 `IRR_JAVA_CP=<client classes>:<gson>:<slf4j>` it also runs the Java exporter on the same files and
 requires record-for-record equality with `irr_dump.py dump`, which keeps the two decoders from
 drifting apart.
+
+## Step 4: fixes after the first real-server test
+
+Analysis of the first record/replay pair (survival world, 824 ticks): both runs were bit-identical
+through tick 181. At tick 181 the player landed and took fall damage. The server sends the
+fall-damage `ClientboundDamageEventPacket` while handling the move, but the velocity reset
+(`ClientboundSetEntityMotionPacket` for the player) only on its next tick's entity sync. In the
+original it arrived 8 ms into client tick 181. In the replay the server's tick phase sat at the
+client's tick boundary (its per-tick packets landed at 90–100% of each client tick versus 0–20% in
+the original), so the packet arrived 0.6 ms after tick 182 started and was applied one tick late.
+The replay is open loop, so the 0.09-block error then grew (wrong block faces, then wrong blocks,
+missed jumps). The flower breaks at tick 213 were a consequence, not the cause.
+
+### Simulated keyboard during replays (bug fix; extends §3.3)
+
+26.3 polls the hardware directly via `InputConstants.isKeyDown` (`SDL_GetKeyboardState`):
+`Minecraft.hasControlDown/hasShiftDown/hasAltDown` (drop whole stack with Ctrl+Q, pick block with
+data, ...) and `KeyMapping.setAll()` (called on mouse grab and focus regain, re-reading every
+mapping from the hardware). In the test, Ctrl+Q (`DROP_ALL_ITEMS`) replayed as `DROP_ITEM`. An
+alt-tab during a replay would also release every replayed held key.
+
+**Change:** `InputConstantsMixin` answers `isKeyDown` from `VirtualKeyboard` while a replay is
+active. Physical mode tracks the recorded key codes. By-name mode tracks the current key of every
+driven mapping, plus modifier keys (SDL scancodes 224–231) by their recorded code, since
+`hasControlDown()` and friends test fixed codes. Keys held at tick 0 are included. The state is
+cleared when the replay ends.
+
+### `diff` noise (§8)
+
+- Ignored classes (keep-alive, chat, ...) are no longer part of the per-tick outbound sequence; they
+  are only counted per class. Previously a keep-alive landing one tick later was reported as the
+  first outbound mismatch (tick 15 in the test).
+- Cursor moves injected by the replayer are recorded one by one instead of being merged per frame,
+  so the replay run's input stream matches the source. Replays recorded before this change still
+  show `CURSOR` differences.
+- New section "Player packets": the inbound packets that can change the player's physics, matched
+  across runs by position in that sequence, with apply-tick changes flagged as "likely cause" when
+  they are at the first divergence. The all-packets list is behind `--all-inbound` (matching by
+  class + occurrence is meaningless with mobs around).
+
+### Packet-sync replay mode (new; addresses §2.4 "packet arrival vs. tick boundary")
+
+Opt-in: "Packet sync" toggle in the recording list, `/inputreplay replay <file> sync`, or
+`-Dinputreplay.sync=true`.
+
+- **Which packets:** `PlayerPackets` (shared rule with `irr_dump.py`). These are
+  `SetEntityMotion`, `UpdateAttributes`, `SetEntityData`, `Update/RemoveMobEffect`,
+  `TeleportEntity` and `EntityPositionSync` whose first field is the player's entity id (from
+  `ClientboundLoginPacket.playerId`), plus `PlayerPosition`, `PlayerRotation`, `Explode`,
+  `PlayerAbilities` and `Respawn`. Classification uses the class name and summary only, so the live
+  run and the recording are classified identically.
+- **Matching:** the k-th player packet of the replay corresponds to the k-th of the recording. A class
+  mismatch, or more packets than the recording has, disables sync for the rest of the run
+  (`SYNC_DISABLED` event, HUD).
+- **Early packets** are held at `ListenerAndPacket.handle` (the call is cancelled and re-run at the
+  start of the recorded tick, before inputs are injected). Player packets stay in order behind a held
+  one. The apply stamp in the replay recording is taken when the packet actually runs.
+- **Late packets:** before each client tick, if a packet the recording applied by that tick has not
+  been handled, the call to `Minecraft.tick()` in `runTick` is skipped (`@WrapOperation`). Frames
+  keep rendering, and the session clock and Fabric tick events do not advance. After
+  `syncTimeoutMs` (default 3000) sync gives up.
+- Packets the recording applied before tick 0, or never, are not gated.
+- Trade-off: sync removes network/tick-phase timing as a source of divergence. That makes the client
+  side reproducible when the server sends the same packets, but it hides timing sensitivity. That is
+  why it is a toggle. `metadata.replaySync` and `replaySummary.packetSync` (held, stalls, stall ms,
+  disabled reason) record what happened.
+- Checked offline: the player-packet sequences of the test pair match class-for-class up to the
+  point where the replay had diverged physically. A scripted harness covers late (tick stalls, then
+  the packet applies before the recorded tick), early (held, released at the recorded tick), on-time,
+  and class mismatch (sync disabled).

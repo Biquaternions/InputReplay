@@ -9,6 +9,7 @@
     "ConnectScreenMixin",
     "ConnectScreenThreadMixin",
     "GuiMixin",
+    "InputConstantsMixin",
     "KeyboardHandlerMixin",
     "KeyMappingAccessor",
     "LocalPlayerAccessor",

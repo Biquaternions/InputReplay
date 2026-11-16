@@ -24,6 +24,7 @@ import gzip
 import io
 import json
 import os
+import re
 import struct
 import sys
 import zipfile
@@ -543,6 +544,35 @@ DEFAULT_IGNORE = ["ServerboundChatPacket", "ServerboundChatCommandSignedPacket",
                   "ServerboundPongPacket", "ServerboundClientInformationPacket", "ServerboundCustomPayloadPacket"]
 INPUT_TYPES = ("KEY", "TEXT", "CHAR", "MOUSE_BUTTON", "SCROLL", "CURSOR", "TURN")
 
+# Inbound packets that change the local player's physics. Keep in sync with PlayerPackets.java.
+PLAYER_BY_ID = {"ClientboundSetEntityMotionPacket", "ClientboundUpdateAttributesPacket", "ClientboundSetEntityDataPacket",
+                "ClientboundUpdateMobEffectPacket", "ClientboundRemoveMobEffectPacket", "ClientboundTeleportEntityPacket",
+                "ClientboundEntityPositionSyncPacket"}
+PLAYER_ALWAYS = {"ClientboundPlayerPositionPacket", "ClientboundPlayerRotationPacket", "ClientboundExplodePacket",
+                 "ClientboundPlayerAbilitiesPacket", "ClientboundRespawnPacket"}
+_FIRST_ID = re.compile(r"^[\w$]+\[(?:id|entityId)=(-?\d+)[,\]]")
+_LOGIN_ID = re.compile(r"^ClientboundLoginPacket\[playerId=(-?\d+)[,\]]")
+
+
+def player_packets(rec: "Recording") -> list[Rec]:
+    """Play-phase inbound packets affecting the local player, in receive order (same rule as the mod)."""
+    out, player_id = [], None
+    for r in sorted(rec.packets_in(), key=lambda r: r.data["pid"]):
+        if r.data["phase"] != "play":
+            continue
+        cls, summary = r.data["className"], r.data["summary"]
+        if cls == "ClientboundLoginPacket":
+            m = _LOGIN_ID.match(summary)
+            player_id = int(m.group(1)) if m else player_id
+            continue
+        if cls in PLAYER_ALWAYS:
+            out.append(r)
+        elif cls in PLAYER_BY_ID and player_id is not None:
+            m = _FIRST_ID.match(summary)
+            if m and int(m.group(1)) == player_id:
+                out.append(r)
+    return out
+
 
 def _by_tick(items: Iterable[tuple[int, Any]], lo: int | None, hi: int | None) -> dict[int, list]:
     out: dict[int, list] = defaultdict(list)
@@ -556,11 +586,13 @@ def _snapshots(rec: Recording) -> dict[int, dict]:
     return {r.tick: r.data for r in rec.records("snapshots") if r.type == "SNAPSHOT"}
 
 
-def _outbound_keys(rec: Recording, ignore: list[str]) -> Iterator[tuple[int, tuple]]:
+def _outbound_keys(rec: Recording, ignore: list[str], ignored: Counter) -> Iterator[tuple[int, tuple]]:
+    """Outbound packets in seq order. Ignored classes (chat, keep-alive, ...) depend on wall-clock timing
+    and server requests, so they are left out of the per-tick sequence and only counted per class."""
     for r in sorted((r for r in rec.records("out") if r.type == "PACKET_OUT"), key=lambda r: r.seq):
         cls = r.data["className"]
         if any(fnmatch.fnmatchcase(cls, g) for g in ignore):
-            yield r.tick, (cls,)
+            ignored[cls] += 1
         else:
             yield r.tick, (cls, r.data["summary"])
 
@@ -634,11 +666,12 @@ def cmd_diff(a) -> int:
     print()
 
     # --- outbound packets
-    oa, ob = _by_tick(_outbound_keys(ra, ignore), lo, hi), _by_tick(_outbound_keys(rb, ignore), lo, hi)
+    ign_a, ign_b = Counter(), Counter()
+    oa, ob = _by_tick(_outbound_keys(ra, ignore, ign_a), lo, hi), _by_tick(_outbound_keys(rb, ignore, ign_b), lo, hi)
     mm = _first_mismatch(oa, ob)
     n_moves = sum(1 for l in oa.values() for k in l if k[0].startswith("ServerboundMovePlayerPacket"))
-    print(f"Outbound packets: {sum(map(len, oa.values()))} vs {sum(map(len, ob.values()))} "
-          f"({n_moves} MovePlayer in A; {len(ignore)} classes compared by class only)")
+    print(f"Outbound packets: {sum(map(len, oa.values()))} vs {sum(map(len, ob.values()))} compared "
+          f"({n_moves} MovePlayer in A)")
     if mm is None:
         print("  identical")
     else:
@@ -647,7 +680,10 @@ def cmd_diff(a) -> int:
         print(f"  FIRST MISMATCH at tick {t}")
         for side, l in (("A", la), ("B", lb)):
             for k in l:
-                print(f"    {side}: {k[0]}  {k[1][:200] if len(k) > 1 else ''}")
+                print(f"    {side}: {k[0]}  {k[1][:200]}")
+    if ign_a or ign_b:
+        counts = ", ".join(f"{c} {ign_a[c]} vs {ign_b[c]}" for c in sorted(set(ign_a) | set(ign_b)))
+        print(f"  not compared (timing-dependent, --strict to include): {counts}")
     print()
 
     # --- inputs and key state
@@ -672,7 +708,33 @@ def cmd_diff(a) -> int:
         print(f"  key state: first difference at tick {k_first}: A={ka[k_first]} B={kb[k_first]}")
     print()
 
-    # --- inbound apply ticks
+    # --- packets affecting the local player (the inbound packets that can change its physics)
+    plA, plB = player_packets(ra), player_packets(rb)
+    print(f"Player packets (velocity, teleport, attributes, effects, entity data, explosions): {len(plA)} vs {len(plB)}")
+    first_cls = next((i for i in range(min(len(plA), len(plB))) if plA[i].data["className"] != plB[i].data["className"]), None)
+    n = first_cls if first_cls is not None else min(len(plA), len(plB))
+    moved_pl = [(i, plA[i], plB[i]) for i in range(n)
+                if plA[i].data["applyTick"] != plB[i].data["applyTick"] and plA[i].data["applyTick"] is not None
+                and plA[i].data["applyTick"] >= lo and (hi is None or plA[i].data["applyTick"] <= hi)]
+    if not moved_pl:
+        print("  all applied at the same tick" + (f" (up to #{n})" if first_cls is not None else ""))
+    for i, x, y in moved_pl[:a.limit]:
+        ta, tb = x.data["applyTick"], y.data["applyTick"]
+        cause = first_snap is not None and ta <= first_snap and (tb is None or tb > ta or tb <= first_snap)
+        print(f"  #{i} {x.data['className']}: A applied @{ta}, B @{tb}"
+              + (f" ({tb - ta:+d})" if tb is not None else "")
+              + ("   <-- at/before the first divergence: likely cause" if cause and ta >= first_snap - 1 else ""))
+        print(f"      {x.data['summary'][:160]}")
+    if len(moved_pl) > a.limit:
+        print(f"  ... {len(moved_pl) - a.limit} more (--limit)")
+    if first_cls is not None:
+        print(f"  sequences differ from #{first_cls} on (A {plA[first_cls].data['className']} @{plA[first_cls].data['applyTick']}, "
+              f"B {plB[first_cls].data['className']} @{plB[first_cls].data['applyTick']}): the server sent different packets")
+    if rb.meta.get("replaySync") is not None:
+        print(f"  B packet sync: {json.dumps((rb.meta.get('replaySummary') or {}).get('packetSync', rb.meta.get('replaySync')))}")
+    print()
+
+    # --- other inbound apply ticks
     def applied(rec: Recording) -> dict[tuple[str, int], int | None]:
         out, n = {}, Counter()
         for r in sorted(rec.packets_in(), key=lambda r: r.seq):
@@ -688,13 +750,15 @@ def cmd_diff(a) -> int:
              and pa[k] >= lo and (hi is None or pa[k] <= hi)
              and not any(fnmatch.fnmatchcase(k[0], g) for g in globs(a.ignore_class))]
     moved.sort(key=lambda m: (m[1], m[0]))
-    print(f"Inbound packets (play phase, matched by class + occurrence): {len(moved)} applied at a different tick")
-    focus = first_snap if first_snap is not None else None
-    shown = moved if focus is None else sorted(moved, key=lambda m: abs(m[1] - focus))
-    for (cls, idx), ta, tb in shown[:a.limit]:
-        print(f"  {cls}#{idx}: A applied @{ta}, B @{tb} ({tb - ta:+d})")
-    if len(moved) > a.limit:
-        print(f"  ... {len(moved) - a.limit} more (--limit)")
+    print(f"All inbound packets (play phase, matched by class + occurrence): {len(moved)} applied at a different tick"
+          + ("" if a.all_inbound else " (--all-inbound to list; noisy with mobs and other players around)"))
+    if a.all_inbound:
+        focus = first_snap if first_snap is not None else None
+        shown = moved if focus is None else sorted(moved, key=lambda m: abs(m[1] - focus))
+        for (cls, idx), ta, tb in shown[:a.limit]:
+            print(f"  {cls}#{idx}: A applied @{ta}, B @{tb} ({tb - ta:+d})")
+        if len(moved) > a.limit:
+            print(f"  ... {len(moved) - a.limit} more (--limit)")
     print()
     print("RESULT: " + ("DIVERGED" if diverged else "no divergence in snapshots or outbound packets"))
     return 1 if diverged else 0
@@ -849,6 +913,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--strict", action="store_true", help="disable the default ignore list")
     p.add_argument("--context", type=int, default=5, help="snapshot rows shown around the first divergence")
     p.add_argument("--limit", type=int, default=20, help="inbound apply-tick changes shown")
+    p.add_argument("--all-inbound", action="store_true", help="list every inbound packet whose apply tick changed")
     p.set_defaults(fn=cmd_diff)
 
     a = ap.parse_args(argv)

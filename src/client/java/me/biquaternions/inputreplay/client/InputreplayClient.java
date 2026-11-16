@@ -61,7 +61,10 @@ public class InputreplayClient implements ClientModInitializer {
         readSystemProperties();
     }
 
-    /** {@code -Dinputreplay.mode=record|replay|plain -Dinputreplay.file=<path> -Dinputreplay.autoconnect=host:port} */
+    /**
+     * {@code -Dinputreplay.mode=record|replay|plain -Dinputreplay.file=<path> -Dinputreplay.autoconnect=host:port},
+     * for replays also {@code -Dinputreplay.physical=true} and {@code -Dinputreplay.sync=true}.
+     */
     private static void readSystemProperties() {
         String mode = System.getProperty("inputreplay.mode");
         if (mode != null) {
@@ -71,7 +74,8 @@ public class InputreplayClient implements ClientModInitializer {
                 case "replay" -> {
                     String file = System.getProperty("inputreplay.file");
                     if (file == null) LOG.error("inputreplay.mode=replay needs -Dinputreplay.file=<path>");
-                    else SessionManager.arm(Mode.REPLAY, Path.of(file), false);
+                    else SessionManager.arm(Mode.REPLAY, Path.of(file), Boolean.getBoolean("inputreplay.physical"),
+                            Boolean.getBoolean("inputreplay.sync"));
                 }
                 default -> LOG.error("Unknown inputreplay.mode '{}'", mode);
             }
@@ -95,8 +99,10 @@ public class InputreplayClient implements ClientModInitializer {
                 .then(literal("replay")
                         .then(argument("file", StringArgumentType.string())
                                 .suggests((c, b) -> SharedSuggestionProvider.suggest(recordingNames(), b))
-                                .executes(c -> armReplay(c, false))
-                                .then(literal("physical").executes(c -> armReplay(c, true)))))
+                                .executes(c -> armReplay(c, ""))
+                                .then(argument("options", StringArgumentType.greedyString())
+                                        .suggests((c, b) -> SharedSuggestionProvider.suggest(List.of("physical", "sync", "physical sync"), b))
+                                        .executes(c -> armReplay(c, StringArgumentType.getString(c, "options"))))))
                 .then(literal("export")
                         .then(argument("file", StringArgumentType.string())
                                 .suggests((c, b) -> SharedSuggestionProvider.suggest(recordingNames(), b))
@@ -151,15 +157,25 @@ public class InputreplayClient implements ClientModInitializer {
         return 1;
     }
 
-    private static int armReplay(CommandContext<FabricClientCommandSource> c, boolean physical) {
+    /** {@code /inputreplay replay <file> [physical] [sync]} */
+    private static int armReplay(CommandContext<FabricClientCommandSource> c, String options) {
+        List<String> opts = List.of(options.toLowerCase().split("\\s+"));
+        boolean physical = opts.contains("physical");
+        boolean sync = opts.contains("sync");
+        for (String o : opts) {
+            if (!o.isEmpty() && !o.equals("physical") && !o.equals("sync")) {
+                c.getSource().sendError(Component.literal("Unknown replay option '" + o + "' (physical, sync)"));
+                return 0;
+            }
+        }
         Path p = SessionManager.resolveRecording(Path.of(StringArgumentType.getString(c, "file")));
         if (!Files.exists(p)) {
             c.getSource().sendError(Component.literal("No such recording: " + p));
             return 0;
         }
-        SessionManager.arm(Mode.REPLAY, p, physical);
+        SessionManager.arm(Mode.REPLAY, p, physical, sync);
         c.getSource().sendFeedback(Component.literal("InputReplay: armed replay of " + p.getFileName()
-                + (physical ? " (physical keys)" : "") + " for the next connection"));
+                + (physical ? " (physical keys)" : "") + (sync ? " (packet sync)" : "") + " for the next connection"));
         return 1;
     }
 

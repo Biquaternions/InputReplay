@@ -33,6 +33,7 @@ public class RecordingListScreen extends Screen {
     private int page;
     private int selected = -1;
     private boolean confirmDelete;
+    private static boolean syncPackets;
     private String message = "";
     private Button replayButton, physicalButton, deleteButton;
 
@@ -140,6 +141,15 @@ public class RecordingListScreen extends Screen {
         deleteButton = addRenderableWidget(Button.builder(Component.literal(confirmDelete ? "Confirm delete" : "Delete"), b -> delete())
                 .bounds(bx + 2 * (bw + 4), by, bw, 20).build());
         addRenderableWidget(Button.builder(Component.literal("Back"), b -> onClose()).bounds(bx + 3 * (bw + 4), by, bw, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("Packet sync: " + (syncPackets ? "ON" : "off")), b -> {
+                    syncPackets = !syncPackets;
+                    init();
+                }).bounds(x + w - 150, 8, 150, 20)
+                .tooltip(net.minecraft.client.gui.components.Tooltip.create(Component.literal(
+                        "Apply packets that affect the player (velocity, teleports, attributes, effects, explosions) at the "
+                                + "same tick as in the recording, pausing client ticks while one is late. Removes network "
+                                + "timing as a source of divergence.")))
+                .build());
         boolean sel = selected >= 0 && selected < entries.size();
         replayButton.active = sel;
         physicalButton.active = sel;
@@ -167,7 +177,7 @@ public class RecordingListScreen extends Screen {
             message = "Nothing to replay: the recording has no ticks after the player loaded";
             return;
         }
-        parent.connectReplay(reader, forcePhysical);
+        parent.connectReplay(reader, forcePhysical, syncPackets);
     }
 
     private void delete() {
@@ -198,7 +208,7 @@ public class RecordingListScreen extends Screen {
     @Override
     public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         super.extractRenderState(g, mouseX, mouseY, partialTick);
-        g.centeredText(font, title, width / 2, 12, 0xFFFFFFFF);
+        g.text(font, title, (width - Math.min(width - 20, 460)) / 2, 14, 0xFFFFFFFF);
         if (entries.isEmpty()) {
             g.centeredText(font, Component.literal("No recordings in " + SessionManager.recordingsDir()), width / 2, 60, 0xFFA0A0A0);
         }

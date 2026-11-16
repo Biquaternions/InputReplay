@@ -32,6 +32,12 @@ public final class RecordingReader {
                            double x, double y, double dx, double dy,
                            String text, int codepoint, List<String> mappingNames, byte[] keyBits) {}
 
+    /**
+     * One inbound packet affecting the local player (see {@code PlayerPackets}), in receive order.
+     * {@code applyTick} is anchored, or null if the packet was never applied on the main thread.
+     */
+    public record PlayerPacket(String className, Integer applyTick) {}
+
     /** Snapshot subset used for drift: position, velocity and rotation. */
     public record Snap(double x, double y, double z, double vx, double vy, double vz, float yRot, float xRot) {}
 
@@ -197,6 +203,46 @@ public final class RecordingReader {
             double vx = f.f64(), vy = f.f64(), vz = f.f64();
             snapshots.put(rawTick - anchorTick, new Snap(x, y, z, vx, vy, vz, yRot, xRot));
         });
+    }
+
+    /** Player-affecting play-phase packets of the recording in receive order (loaded on demand). */
+    public List<PlayerPacket> loadPlayerPackets() throws IOException {
+        byte[] data;
+        try (Source src = Source.open(path)) {
+            data = gunzip(src.read(Records.Stream.PACKETS_IN.fileName));
+        }
+        java.util.Map<Long, Integer> applyTicks = new java.util.HashMap<>();
+        List<long[]> order = new ArrayList<>(); // {pid}
+        List<String> classes = new ArrayList<>();
+        Integer[] playerId = {null};
+        forEach(data, (type, seq, rawTick, f, start, end) -> {
+            if (type == Records.PACKET_APPLY) {
+                applyTicks.put(f.uvarint(), rawTick - anchorTick);
+                return;
+            }
+            if (type != Records.PACKET_IN) return;
+            long pid = f.uvarint();
+            String phase = f.str();
+            f.svarint(); // packet id
+            String cls = f.str();
+            if (!phase.equals("play")) return;
+            boolean login = cls.equals("ClientboundLoginPacket");
+            if (!login && !me.biquaternions.inputreplay.client.capture.PlayerPackets.isCandidate(cls)) return;
+            f.svarint(); // bundle index
+            f.uvarint(); // size
+            f.u8(); // payload mode
+            String summary = f.str();
+            if (login) {
+                playerId[0] = me.biquaternions.inputreplay.client.capture.PlayerPackets.loginPlayerId(cls, summary);
+                return;
+            }
+            if (!me.biquaternions.inputreplay.client.capture.PlayerPackets.targetsPlayer(cls, summary, playerId[0])) return;
+            order.add(new long[]{pid});
+            classes.add(cls);
+        });
+        List<PlayerPacket> out = new ArrayList<>(order.size());
+        for (int i = 0; i < order.size(); i++) out.add(new PlayerPacket(classes.get(i), applyTicks.get(order.get(i)[0])));
+        return out;
     }
 
     /** Decompresses a gzip stream, keeping whatever decodes if it is truncated. */

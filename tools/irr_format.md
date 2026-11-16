@@ -148,7 +148,7 @@ Names: `SESSION_START`, `CONNECTED`, `PLAYER_LOADED` (`rawTick`, `anchorSeq`), `
 `SESSION_END` (`reason`). Replay runs add `REPLAY_ARMED` (`file`, `bindingMode`, `durationTicks`),
 `REPLAY_STARTED` (`heldAtStart`), `REPLAY_COMPLETE`, `REPLAY_ABORTED` (`reason`, `tick`),
 `REPLAY_PAUSED_ON_DRIFT` (`tick`, `dpos`), `REPLAY_SUMMARY`, `BINDING_MISMATCH` (`mappings`) and
-`OPTION_MISMATCH` (`options`).
+`OPTION_MISMATCH` (`options`), and in packet-sync mode `SYNC_DISABLED` (`reason`).
 
 ## `options.txt`
 
